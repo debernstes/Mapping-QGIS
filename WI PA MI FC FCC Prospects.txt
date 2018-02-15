@@ -1,0 +1,610 @@
+DEFINE project_table = 'miwipa_fccprospect';
+
+DROP TABLE &project_table;
+
+CREATE TABLE &project_table AS 
+SELECT vrt.roi_id,
+       vrt.roi_family_id,
+       'General Member' Member_Level
+FROM v_receipt_transaction vrt,
+     v_receipt_batch vrb,
+     v_campaign_source vcs
+WHERE vrt.batch_id = vrb.batch_id
+  AND vrt.source_id = vcs.source_id
+  AND vrt.include_in_calculations = 'Y'
+  AND vrt.net_amount >= 5
+  AND vrb.batch_date >= ADD_MONTHS(SYSDATE, -24)
+  AND vcs.fund_allocation <> vg_select('FOUNDATION','PLEDGE_FUND_ALLOCATION')
+  AND vrt.transaction_type <> vg_select('SOFT_PAYMENT','TRANSACTION_TYPE')
+  AND vrt.roi_id IN ( SELECT DISTINCT roi_id
+                      FROM v_account_profile
+                      WHERE account_classification = vg_select('INDIVIDUAL','ACCOUNT_CLASS')
+                    )
+  AND vrt.roi_id IN ( SELECT roi_id 
+                      FROM v_account_primary_address
+                      WHERE (state IN vg_select('MI', 'STATE')
+                             OR state IN vg_select('WI', 'STATE')
+                             OR state IN vg_select('PA', 'STATE')
+                            )
+                    ) 
+GROUP BY vrt.roi_id, vrt.roi_family_id;
+COMMIT;
+       
+DROP INDEX mdpros_rid_idx;
+
+CREATE INDEX mdpros_rid_idx ON &project_table (roi_id);
+COMMIT;
+
+DROP INDEX mdpros_rfid_idx;
+
+CREATE INDEX mdpros_rfid_idx ON &project_table (roi_family_id);
+COMMIT;
+
+-- CREATE TEMP TABLE FOR FC-FCC
+
+-- Drop temp table in case it exists
+DROP TABLE federal_club_temp;
+
+-- Create temp table
+CREATE TABLE federal_club_temp NOLOGGING AS
+SELECT a.roi_id roi_id,
+       vg_code(a.membership_sub_status) fc_status, 
+       vg_code(a.membership_sub_level) fc_level,
+       a.membership_sub_status_date fc_status_date
+FROM v_account_sub1_membership a
+WHERE a.membership_sub_level IN
+( SELECT validation_id 
+  FROM validation_general 
+  WHERE roi_aux2 in ('FEDERAL CLUB','FEDERAL CLUB COUNCIL')
+)
+AND a.roi_id IN
+( SELECT roi_id
+  FROM &project_table
+);
+COMMIT;
+
+
+CREATE INDEX idx_tmp_fcfcc ON federal_club_temp (roi_id);
+
+
+-- CREATE TEMP TABLE FOR PARTNERS
+
+-- Drop in case temp table exists
+DROP TABLE partners_tmp;
+
+-- Create a new temp table
+CREATE TABLE partners_tmp NOLOGGING AS
+SELECT roi_id,
+       pledge_id,
+       VG_CODE(pledge_type) plgtype,
+       VG_CODE(pledge_status) plgstatus,
+       VG_CODE(pledge_status_reason) pledge_status_reason,
+       pledge_amount,
+       pledge_date,
+       pledge_end_date
+FROM v_account_pledge
+WHERE pledge_type = VG_SELECT('PARTNERS','PLEDGE_TYPE')
+  AND roi_id IN
+( SELECT roi_id
+  FROM &project_table
+);
+
+
+CREATE INDEX idx_tmp_partners ON partners_tmp (roi_id);
+
+CREATE INDEX idx1_tmp_partners ON partners_tmp (pledge_id);
+
+ALTER TABLE partners_tmp ADD pledge_total_transactions NUMBER;
+
+UPDATE partners_tmp a
+SET a.pledge_total_transactions = 
+( SELECT COUNT(b.transaction_id) 
+  FROM v_receipt_transaction b 
+  WHERE b.pledge_id = a.pledge_id 
+    AND b.include_in_calculations = 'Y' 
+    AND b.net_amount > 0
+);
+COMMIT;
+
+
+-- PARTNERS - ACTIVE
+
+UPDATE &project_table
+SET member_level = 'Active Partner'
+WHERE roi_id IN
+( SELECT roi_id 
+  FROM partners_tmp
+  WHERE plgtype = 'PARTNERS' 
+    AND plgstatus = 'ACTIVE'
+);
+COMMIT;
+
+-- FEDERAL CLUB - FC1, FC2, FC3 ACTIVE 
+UPDATE &project_table
+SET  member_level = 'Active Fedclub'
+where roi_id IN
+( SELECT b.roi_id 
+  FROM federal_club_temp b
+  WHERE b.fc_level IN ('FC1','FC2','FC3')
+    AND b.fc_status = 'A'
+);
+COMMIT;
+
+/***********************/
+/*                     */
+/*    SUPPRESSIONS     */
+/*                     */
+/***********************/
+
+
+ALTER TABLE &project_table ADD suppression_reject CHAR(3);
+COMMIT;
+
+-- SUPPRESSION # F01: NEVER CONTACT (FLAG ID = NEVER)
+
+UPDATE &project_table
+SET suppression_reject = 'F01'
+where suppression_reject IS NULL 
+AND roi_id IN
+( SELECT roi_id 
+  FROM v_account_flag_active 
+  WHERE flag_id = vg_flag('NEVER','FLAGSTD')
+);
+COMMIT;
+
+
+-- SUPPRESSION # P09: MAJOR DONOR - ACTIVE 
+UPDATE &project_table
+SET suppression_reject = 'P09'
+WHERE suppression_reject IS NULL
+AND roi_id IN
+( SELECT roi_id
+  FROM federal_club_temp
+  WHERE fc_level not in ('FC1','FC2','FC3')
+    AND fc_status = 'A'
+);
+COMMIT;
+
+-- SUPPRESSION # S12: ACCOUNT STATUS = DECEASED
+
+UPDATE &project_table
+SET suppression_reject = 'S12'
+WHERE roi_id IN
+( SELECT roi_id
+  FROM v_account_profile_family
+  WHERE deceased_date IS NOT NULL
+);
+COMMIT;
+
+
+
+
+/******************/
+/*                */
+/*     OUTPUT     */
+/*                */
+/******************/
+
+-- INDICATORS FOR DO NOT CALL/SOLICIT/BAD ADDRESS
+
+
+ALTER TABLE &project_table ADD contact_details VARCHAR2(50);
+COMMIT;
+
+-- BAD ADDRESS
+UPDATE &project_table
+SET contact_details  = 'Bad Address'
+WHERE suppression_reject IS NULL
+AND contact_details IS NULL
+AND roi_id IN
+( SELECT roi_id 
+  FROM v_account_primary_address 
+  WHERE address_status = vg_select('BAD_ADDRESS','ADDRESS_STATUS')
+);
+COMMIT;
+
+-- DO NOT SOLICIT (FLAG ID = 'NOSOL')
+
+UPDATE &project_table
+SET contact_details  = 'Do Not Solicit'
+WHERE suppression_reject IS NULL
+AND contact_details IS NULL
+AND roi_id IN
+( SELECT roi_id
+  FROM v_account_flag_active
+  WHERE flag_id = vg_flag('NOSOL','FLAGSTD')
+);
+COMMIT;
+
+-- DO NOT MAIL (FLAG ID = 'DNMAIL')
+
+UPDATE &project_table
+SET contact_details  = 'Do Not Mail'
+WHERE suppression_reject IS NULL
+AND contact_details IS NULL
+AND roi_id IN
+( SELECT roi_id
+  FROM v_account_flag_active
+  WHERE flag_id = vg_flag('DNMAIL','FLAGSTD')
+);
+COMMIT;
+
+-- NO PHONE CALLS (FLAG ID = DNP)
+
+UPDATE &project_table
+set contact_details = 'Do Not Phone'
+WHERE suppression_reject IS NULL
+AND contact_details IS NULL
+AND roi_id IN
+( SELECT roi_id 
+  FROM v_account_flag_active 
+  WHERE flag_id = vg_flag('DNP','FLAGSTD')
+);
+COMMIT;
+
+-- DO NOT EMAIL (FLAG ID = DNEM)
+
+UPDATE &project_table
+set contact_details = 'Do Not Email'
+WHERE suppression_reject IS NULL 
+AND contact_details IS NULL
+AND roi_id IN
+( SELECT roi_id 
+  FROM v_account_flag_active 
+  WHERE flag_id = vg_flag('DNEM','FLAGSTD')
+);
+COMMIT;
+
+-- OUTPUT HOH NAME INFO
+
+ALTER TABLE &project_table ADD
+( name_prefix varchar2(64),
+  name_first varchar2(64),
+  name_middle varchar2(64),
+  name_last varchar2(64),
+  name_suffix varchar2(64)
+);
+
+UPDATE &project_table p SET
+( p.name_prefix, 
+  p.name_first,
+  p.name_middle,
+  p.name_last,
+  p.name_suffix
+) = 
+( SELECT vg_name(vapf.name_prefix),
+         vapf.NAME_FIRST,
+         vapf.name_middle,
+         vapf.NAME_LAST,
+         vapf.name_Suffix
+  FROM v_account_profile_family vapf
+  WHERE vapf.roi_family_id = vapf.roi_id
+    AND vapf.roi_family_id = p.roi_id
+);
+COMMIT;
+
+
+-- OUTPUT ADDRESSEE AND SALUTATION
+
+ALTER TABLE &project_table ADD household_addressee VARCHAR2(100);
+
+UPDATE &project_table p
+SET household_addressee = 
+( SELECT household_address_line
+  FROM v_account_profile vap
+  WHERE p.roi_id = vap.roi_id
+);
+COMMIT;
+
+-- OUTPUT ADDRESS BLOCK
+
+ALTER TABLE &project_table ADD
+( address_status varchar2(100),
+  street varchar2(255),
+  address_altline1 varchar2(255),
+  address_altline2 varchar2(100),
+  city varchar2(255),
+  state varchar2(255),
+  zipcode varchar2(255),
+  country varchar2(255)
+);
+
+UPDATE &project_table p SET
+( p.street,
+  p.address_altline1,
+  p.address_altline2,
+  p.address_status,
+  p.city,
+  p.state,
+  p.zipcode,
+  p.country
+) =
+( SELECT vap.street,
+         vap.address_altline1,
+         vap.address_altline2,
+         vg_name(vap.address_status),
+         vap.city,
+         vg_code(vap.state),
+         zipcode,
+         vg_code(vap.country)
+  FROM v_account_primary_address vap
+  WHERE vap.roi_id = p.roi_id
+);
+COMMIT;
+
+
+-- OUTPUT EMAIL BLOCK
+
+-- Primary Email
+
+ALTER TABLE &project_table ADD email VARCHAR2(255);
+
+UPDATE &project_table p
+SET p.email =
+( SELECT vae.email
+  FROM v_account_email vae
+  WHERE p.roi_id = vae.roi_family_id
+    AND vae.email_type = vg_select('EMAIL1', 'EMAIL_TYPE')
+    AND vae.email_contact_status = 'Y'
+);
+COMMIT;
+
+-- OUTPUT GIFT SUMMARY
+
+ALTER TABLE &project_table ADD 
+( mrc_date DATE,
+  mrc_source VARCHAR2(9),
+  mrc_amount NUMBER,
+  hpc_date DATE,
+  hpc_source VARCHAR2(9),
+  hpc_amount NUMBER,
+  freq NUMBER,
+  total_amount NUMBER
+);
+COMMIT;
+   
+UPDATE &project_table p SET 
+( mrc_date,
+  mrc_source,
+  mrc_amount,
+  hpc_date,
+  hpc_source,
+  hpc_amount,
+  freq,
+  total_amount
+) = 
+( SELECT MAX(vrb.batch_date) AS mrc_date,
+         SUBSTR(MAX(vcs.source_code) KEEP (DENSE_RANK LAST ORDER BY vrb.batch_date), 1, 9) AS mrc_source,
+         MAX(vrt.net_amount) KEEP (DENSE_RANK LAST ORDER BY vrb.batch_date) AS mrc_amount,
+         MAX(vrb.batch_date) KEEP (DENSE_RANK LAST ORDER BY vrt.net_amount) AS hpc_date,
+         SUBSTR(MAX(vcs.source_code) KEEP (DENSE_RANK LAST ORDER BY vrt.net_amount), 1, 9) AS hpc_source,
+         MAX(vrt.net_amount) AS hpc_amount,
+         COUNT(vrt.transaction_id) AS freq,
+         SUM(vrt.net_amount) AS total_amount
+  FROM v_receipt_transaction vrt,
+       v_receipt_batch vrb,
+       v_campaign_source vcs
+  WHERE vrt.batch_id = vrb.batch_id
+    AND vrt.source_id = vcs.source_id
+    AND vrt.include_in_calculations = 'Y'
+    AND net_amount > 0
+    AND vrt.roi_id = p.roi_id
+);
+COMMIT;
+
+-- OUTPUT WE MAIN BLOCK
+
+-- MG DECILE
+
+ALTER TABLE &project_table ADD we_mg_decile VARCHAR2(25);
+
+UPDATE &project_table p
+SET we_mg_decile =
+ ( SELECT b.column_value AS mg_decile
+   FROM v_account_profile_family a, v_account_profile_family_u b
+   WHERE a.roi_family_id = b.parent_id
+     AND user_defined_column = vg_select('WEMGDECILE', 'UD_PROFILE_FAMILY')
+     AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+
+-- MG RANK
+
+ALTER TABLE &project_table ADD we_mg_rank VARCHAR2(25);
+
+UPDATE &project_table p
+SET we_mg_rank =
+ ( SELECT b.column_value AS mg_rank
+   FROM v_account_profile_family a, v_account_profile_family_u b
+   WHERE a.roi_family_id = b.parent_id
+     AND user_defined_column = vg_select('WEMGRANK', 'UD_PROFILE_FAMILY')
+     AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+
+--P2G SCORE
+ 
+ALTER TABLE &project_table ADD we_p2g_score VARCHAR2(25);
+
+UPDATE &project_table p
+SET we_p2g_score =
+ ( SELECT substr(b.column_value,1,1) AS p2g_score
+   FROM v_account_profile_family a, v_account_profile_family_u b
+   WHERE a.roi_family_id = b.parent_id
+     AND user_defined_column = vg_select('WEP2GSC', 'UD_PROFILE_FAMILY')
+     AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+
+ALTER TABLE &project_table ADD we_p2g_score2 VARCHAR2(25);
+
+
+UPDATE &project_table p
+SET we_p2g_score2 =
+ ( SELECT substr(b.column_value,3,1) AS p2g_score2
+   FROM v_account_profile_family a, v_account_profile_family_u b
+   WHERE a.roi_family_id = b.parent_id
+     AND user_defined_column = vg_select('WEP2GSC', 'UD_PROFILE_FAMILY')
+     AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+ 
+--GIVE CAPACITY
+
+ALTER TABLE &project_table ADD we_give_capacity VARCHAR2(35);
+
+UPDATE &project_table p
+SET we_give_capacity = 
+( SELECT b.column_value AS give_capacity
+  FROM v_account_profile_family a,
+       v_account_profile_family_u b
+  WHERE a.roi_family_id = b.parent_id
+    AND user_defined_column = vg_select('WEEGCAP', 'UD_PROFILE_FAMILY')
+    AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+
+--ESTIMATED ANNUAL DONATIONS
+
+ALTER TABLE &project_table ADD we_annual_donations VARCHAR2(35);
+
+UPDATE &project_table p
+SET we_annual_donations = 
+( SELECT b.column_value AS annual_donations
+  FROM v_account_profile_family a,
+       v_account_profile_family_u b
+  WHERE a.roi_family_id = b.parent_id
+    AND user_defined_column = vg_select('WEEAD', 'UD_PROFILE_FAMILY')
+    AND p.roi_id = a.roi_family_id
+);
+COMMIT;
+
+-- OUTPUT CONGRESSIONAL DISTRICT
+
+ALTER TABLE &project_table ADD congressional_district VARCHAR2(2);
+
+UPDATE &project_table p
+SET congressional_district = 
+( SELECT ROI_GET_DISTRICT_CD(VG_CODE(state), zipcode, congressional_district)
+  FROM v_account_primary_address vap
+  WHERE vap.roi_id = p.roi_id
+);
+COMMIT;
+
+
+UPDATE &project_table p SET
+( we_p2g_score2,
+ we_p2g_score,
+ we_give_capacity
+) =
+( SELECT max(P2GSCORE2), max(P2GSCORE), max(ESTIMATEDCAPACITYRANGE)
+  FROM UP_7990_299500 up
+  WHERE up.roiid = p.roi_id
+)
+WHERE p.we_p2g_score is null
+  AND p.we_give_capacity is null
+  AND p.we_p2g_score2 is null;
+COMMIT;
+
+
+
+-- SUPPRESSION # C01: CONGRESSIONAL DISTRICTS IN PA
+
+UPDATE &project_table
+SET suppression_reject = 'C01'
+WHERE state = 'PA'
+AND congressional_district not in (3, 4, 5, 9, 10, 11, 12, 14, 15, 16, 17, 18);
+COMMIT;
+
+-- INDICATOR FOR ABOVE $25
+ALTER TABLE &project_table ADD gift_25 CHAR(1) DEFAULT 'N';
+
+UPDATE &project_table p
+SET gift_25 = 'Y'
+WHERE roi_family_id in
+(SELECT vrt.roi_family_id
+FROM v_receipt_transaction vrt
+WHERE vrt.include_in_calculations = 'Y'
+AND p.member_level = 'Active Partner'
+HAVING sum(vrt.net_amount) >= 25
+GROUP BY vrt.roi_family_id);
+COMMIT;
+
+
+UPDATE &project_table p
+SET gift_25 = 'Y'
+WHERE roi_family_id in
+(SELECT vrt.roi_family_id
+FROM v_receipt_transaction vrt
+WHERE vrt.include_in_calculations = 'Y'
+ AND vrt.net_amount >= 25)
+AND p.gift_25 = 'N';
+COMMIT;
+
+- OUTPUT PHONE BLOCK
+
+-- Cell Phone
+
+ALTER TABLE &project_table ADD
+( cell_phone varchar2(255),
+  cell_phone_ver date,
+  cell_phone_is_bad varchar2(1)
+);
+
+UPDATE &project_table p
+SET ( p.cell_phone,
+      p.cell_phone_ver,
+      p.cell_phone_is_bad
+) =
+( SELECT vap.phone_number,
+         vap.verification_date,
+         vap.bad_phone_number
+  FROM v_account_phone vap
+  WHERE p.roi_id = vap.roi_family_id
+    AND vap.phone_type = VG_SELECT('CELLULAR', 'PHONE_TYPE')
+);
+COMMIT;
+
+-- Home Phone
+
+ALTER TABLE &project_table ADD
+( home_phone varchar2(255),
+  home_phone_ver date,
+  home_phone_is_bad varchar2(1)
+);
+
+UPDATE &project_table p
+SET ( p.home_phone,
+      p.home_phone_ver, 
+      p.home_phone_is_bad
+) =
+( SELECT vap.phone_number,
+         vap.verification_date,
+         vap.bad_phone_number
+  FROM v_account_phone vap
+  WHERE p.roi_id = vap.roi_family_id
+    AND vap.phone_type = VG_SELECT('HOME1', 'PHONE_TYPE')
+);
+COMMIT;
+
+-- Second Home Phone
+
+ALTER TABLE &project_table ADD
+( second_home_phone varchar2(255),
+  second_home_phone_ver date,
+  second_home_phone_is_bad varchar2(1)
+);
+
+UPDATE &project_table p
+SET ( p.second_home_phone,
+      p.second_home_phone_ver, 
+      p.second_home_phone_is_bad
+) =
+( SELECT vap.phone_number,
+         vap.verification_date,
+         vap.bad_phone_number
+  FROM v_account_phone vap
+  WHERE p.roi_id = vap.roi_family_id
+    AND vap.phone_type = VG_SELECT('HOME2', 'PHONE_TYPE')
+);
+COMMIT;
